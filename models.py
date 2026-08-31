@@ -1,6 +1,8 @@
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union, Annotated
 from pydantic import BaseModel
 from datetime import datetime
+from typing_extensions import Literal, TypeAlias
+from fastapi import UploadFile, Form
 
 
 class VectorStoreCreateRequest(BaseModel):
@@ -76,6 +78,7 @@ class EmbeddingBatchCreateResponse(BaseModel):
     object: str = "embedding.batch"
     data: List[EmbeddingResponse]
     created: int
+    total_content_length: int
 
 
 class VectorStoreListResponse(BaseModel):
@@ -84,3 +87,66 @@ class VectorStoreListResponse(BaseModel):
     first_id: Optional[str] = None
     last_id: Optional[str] = None
     has_more: bool = False
+
+
+class StaticFileChunkingStrategy(BaseModel):
+    chunk_overlap_tokens: int
+    max_chunk_size_tokens: int
+
+
+class AutoFileChunkingStrategyParam(BaseModel):
+    type: Literal["auto"]
+
+
+class StaticFileChunkingStrategyObjectParam(BaseModel):
+    type: Literal["auto"]
+    static: StaticFileChunkingStrategy
+
+
+FileChunkingStrategyParam: TypeAlias = Union[
+    AutoFileChunkingStrategyParam, StaticFileChunkingStrategyObjectParam
+]
+
+
+class VectorStoreFileRequest(BaseModel):
+    file_id: str
+    attributes: Optional[Dict[str, Any]] = None
+    chunking_strategy: Optional[FileChunkingStrategyParam] = None
+
+
+class ExpiresAfterObject(BaseModel):
+    anchor: Literal["created_at"]
+    seconds: int
+
+
+class UploadFileRequest(BaseModel):
+    file: UploadFile
+    purpose: str
+    expires_after: Optional[ExpiresAfterObject] = None
+
+
+class UploadFileResponse(BaseModel):
+    id: str
+    object: Literal["file"]
+    bytes: int
+    created_at: int
+    filename: str
+    purpose: str
+    expires_at: Optional[int] = None
+
+
+class VectorStoreFileResponse(BaseModel):
+    id: str
+    created_at: int
+    last_error: Optional[Dict[str, Any]] = None
+    object: str = "vector_store.file"
+    status: str
+    usage_bytes: int
+    vector_store_id: str
+    attributes: Optional[Dict[str, Any]] = None
+    chunking_strategy: Optional[StaticFileChunkingStrategy] = None
+
+class DeleteFileResponse(BaseModel):
+    id: str
+    object: str = "file"
+    deleted: bool = True

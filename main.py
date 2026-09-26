@@ -515,7 +515,7 @@ async def _create_embeddings_batch(
         # Update vector store statistics
         # TODO do this through the ORM classes
         update_statistics_statement = f"""
-            UPDATE vectorstore
+            UPDATE {settings.database_schema}.vectorstore
             SET
                 file_counts = jsonb_set(
                     jsonb_set(

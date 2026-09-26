@@ -36,7 +36,6 @@ class Settings(BaseSettings):
     """Application settings"""
     # Database configuration
     database_url: str = ""
-    database_url_2: str = ""
 
     # API configuration
     server_api_key: str = "your-api-key-here"
@@ -81,7 +80,7 @@ class Settings(BaseSettings):
 
     @property
     def database_schema(self) -> str:
-        return get_db_schema_name(self.database_url_2)
+        return get_db_schema_name(self.database_url)
 
 # Global settings instance
 settings = Settings()

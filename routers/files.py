@@ -11,7 +11,9 @@ from models import (
 from classes.s3_file_handler import S3FileHandler
 from util import get_litellm_vkey_info
 from config import settings
-from classes.database import database_instance
+from classes.database import database_instance, File
+from sqlmodel import select, col
+from uuid import UUID
 
 router = APIRouter()
 
@@ -23,46 +25,61 @@ async def upload_file(
     data: Annotated[UploadFileRequest, Form()],
     litellm_vkey_info = Depends(get_litellm_vkey_info),
 ):
-    file = data.file
-    if not file.size or not file.filename:
-        raise HTTPException(status_code=500, detail="File upload failed")
+    try:
+        file = data.file
+        if not file.size or not file.filename:
+            raise HTTPException(status_code=500, detail="File upload failed")
 
-    # TODO replace with call that creates a s3 or local file handler, depending on configuration
-    s3_file_handler = S3FileHandler(
-        region=settings.s3_region,
-        access_key=settings.s3_access_key,
-        secret_key=settings.s3_secret_key,
-        bucket=settings.s3_bucket,
-        host=settings.s3_host
+        # TODO replace with call that creates a s3 or local file handler, depending on configuration
+        s3_file_handler = S3FileHandler(
+            region=settings.s3_region,
+            access_key=settings.s3_access_key,
+            secret_key=settings.s3_secret_key,
+            bucket=settings.s3_bucket,
+            host=settings.s3_host
+            )
+
+        team = litellm_vkey_info['info']['team_id']
+        user = None if team else litellm_vkey_info['info']['user_id']
+        key_user_or_team_type = "user" if user else "team"
+        key_user_or_team_id = user if user else team
+        upload_res = await s3_file_handler.upload_file(file, f"{key_user_or_team_type}/{key_user_or_team_id}")
+
+        session = database_instance.session()
+        new_file = File(
+            user_id=user,
+            team_id=team,
+            filename=file.filename,
+            size=file.size,
+            purpose=data.purpose,
+            created_at=datetime.datetime.now(),
+            expires_at=None,
+            filename_on_disk=upload_res['s3_key']
         )
 
-    key_user_or_team_type = "team" if litellm_vkey_info['info']['team_id'] else "user"
-    key_user_or_team_id = litellm_vkey_info['info']['team_id'] if litellm_vkey_info['info']['team_id'] else litellm_vkey_info['info']['user_id']
-    upload_res = await s3_file_handler.upload_file(file, f"{key_user_or_team_type}/{key_user_or_team_id}")
+        session.add(new_file)
+        session.commit()
+        session.refresh(new_file)
+        session.close()
 
-    print(upload_res)
+        return UploadFileResponse(
+            id=new_file.id.hex,
+            bytes=file.size,
+            created_at=int(new_file.created_at.timestamp()),
+            filename=file.filename,
+            purpose=data.purpose,
+            object="file",
+        )
 
-    dbobject = await database_instance._db.file.create(
-        data={
-            "user_id": litellm_vkey_info['info']['user_id'] if not litellm_vkey_info['info']['team_id'] else None,
-            "team_id": litellm_vkey_info['info']['team_id'],
-            "filename": file.filename,
-            "size": file.size,
-            "purpose": data.purpose,
-            "created_at": datetime.datetime.now(),
-            "expires_at": None,
-            "filename_on_disk": upload_res['s3_key'],
-        }
-    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
 
-    return UploadFileResponse(
-        id=dbobject.id,
-        bytes=file.size,
-        created_at=dbobject.created_at.strftime("%s"),
-        filename=file.filename,
-        purpose=data.purpose,
-        object="file",
-    )
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create embedding: {str(e)}"
+        )
 
 @router.delete("/v1/files/{file_id}", response_model=DeleteFileResponse)
 async def delete_file(
@@ -72,35 +89,47 @@ async def delete_file(
     """
     Delete a file, from storage aswell as from all vector stores.
     """
-    if litellm_vkey_info['info']['team_id']:
-        get_file_query = f"""SELECT id, filename_on_disk FROM "File" WHERE id = $1 AND team_id = $2"""
-        get_file_result = await database_instance._db.query_raw(get_file_query, file_id, litellm_vkey_info['info']['team_id'])
-    elif litellm_vkey_info['info']['user_id']:
-        get_file_query = f"""SELECT id, filename_on_disk FROM "File" WHERE id = $1 AND user_id = $2"""
-        get_file_result = await database_instance._db.query_raw(get_file_query, file_id, litellm_vkey_info['info']['user_id'])
-    else:
-        raise HTTPException(status_code=401)
+    try:
+        team = litellm_vkey_info['info']['team_id']
+        user = None if team else litellm_vkey_info['info']['user_id']
 
-    print(get_file_result)
-    if not get_file_result:
-        raise HTTPException(status_code=404, detail="File not found")
+        session = database_instance.session()
+        statement = select(File).where(col(File.id) == UUID(file_id))
 
-    # TODO replace with call that creates a s3 or local file handler, depending on configuration
-    s3_file_handler = S3FileHandler(
-        region=settings.s3_region,
-        access_key=settings.s3_access_key,
-        secret_key=settings.s3_secret_key,
-        bucket=settings.s3_bucket,
-        host=settings.s3_host
+        if user:
+            statement = statement.where(File.user_id == user)
+        else:
+            statement = statement.where(File.team_id == team)
+
+        file = session.exec(statement).first()
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # TODO replace with call that creates a s3 or local file handler, depending on configuration
+        s3_file_handler = S3FileHandler(
+            region=settings.s3_region,
+            access_key=settings.s3_access_key,
+            secret_key=settings.s3_secret_key,
+            bucket=settings.s3_bucket,
+            host=settings.s3_host
+            )
+
+        await s3_file_handler.delete_file(file.filename_on_disk)
+
+        session.delete(file)
+        session.commit()
+        session.close()
+
+        # TODO update vector store statistics
+
+        return DeleteFileResponse(id=file_id)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create embedding: {str(e)}"
         )
-
-    await s3_file_handler.delete_file(get_file_result[0]['filename_on_disk'])
-
-    if litellm_vkey_info['info']['team_id']:
-        base_query = f"""DELETE FROM "File" WHERE id = $1 AND team_id = $2"""
-        deletion_query_result = await database_instance._db.query_raw(base_query, file_id, litellm_vkey_info['info']['team_id'])
-    elif litellm_vkey_info['info']['user_id']:
-        base_query = f"""DELETE FROM "File" WHERE id = $1 AND user_id = $2"""
-        deletion_query_result = await database_instance._db.query_raw(base_query, file_id, litellm_vkey_info['info']['user_id'])
-
-    return DeleteFileResponse(id=file_id)

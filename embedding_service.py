@@ -68,9 +68,7 @@ class EmbeddingService:
                 dimensions=self.config.dimensions
             )
 
-            # Extract embeddings from response
-            # embeddings = [item["embedding"] for item in response.data]
-
+            embedding_list = []
             # Validate embedding dimensions
             for i, embedding in enumerate(response.data):
                 embedding_data = embedding['embedding']
@@ -79,8 +77,9 @@ class EmbeddingService:
                         f"Expected embedding dimension {self.config.dimensions} for text {i}, "
                         f"got {len(embedding_data)}"
                     )
+                embedding_list.append(embedding_data)
 
-            return response.data
+            return embedding_list
 
         except Exception as e:
             raise RuntimeError(f"Failed to generate embeddings: {str(e)}")

@@ -4,19 +4,16 @@ import time
 import shutil
 import uuid
 import datetime
-from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Depends, Header, Form
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from prisma import Prisma
 from dotenv import load_dotenv
 from typing import Annotated
 from docling.document_converter import DocumentConverter
 from docling_core.transforms.chunker.line_chunker import LineBasedTokenChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from transformers import AutoTokenizer
-from httpx import AsyncClient
 
 from models import (
     VectorStoreCreateRequest,
@@ -39,8 +36,10 @@ from config import settings
 from embedding_service import embedding_service
 from classes.s3_file_handler import S3FileHandler
 from util import get_litellm_vkey_info
-from classes.database import database_instance
 from routers import files
+from classes.database import database_instance, VectorStore, Embedding, File, VectorStoreFile
+from sqlmodel import select, col, text, desc
+from sqlalchemy import label
 
 load_dotenv()
 
@@ -63,7 +62,7 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-db = database_instance._db
+db = database_instance.session()
 
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Validate API key from Authorization header"""
@@ -72,16 +71,17 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
         raise HTTPException(status_code=401, detail="Invalid API key")
     return credentials.credentials
 
-@app.on_event("startup")
-async def startup():
-    """Connect to database on startup"""
-    await db.connect()
+
+# @app.on_event("startup")
+# async def startup():
+#     """Connect to database on startup"""
+#     await db.connect()
 
 
 @app.on_event("shutdown")
 async def shutdown():
     """Disconnect from database on shutdown"""
-    await db.disconnect()
+    db.close()
 
 
 async def generate_query_embedding(query: str, litellm_vkey: str) -> List[float]:
@@ -104,54 +104,42 @@ async def create_vector_store(
     Create a new vector store.
     """
     try:
-        # Use raw SQL to insert the vector store with configurable table/field names
-        vector_store_table = settings.table_names["vector_stores"]
         team = litellm_vkey_info['info']['team_id']
         user = None if team else litellm_vkey_info['info']['user_id']
 
-        result = await db.query_raw(
-            f"""
-            INSERT INTO {vector_store_table} (id, name, user_id, team_id, file_counts, status, usage_bytes, expires_after, metadata, created_at)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW())
-            RETURNING id, name, file_counts, status, usage_bytes, expires_after, expires_at, last_active_at, metadata,
-                     EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
-            """,
-            request.name,
-            user,
-            team,
-            {"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0},
-            "completed",
-            0,
-            request.expires_after,
-            request.metadata or {},
+        store = VectorStore(
+            name=request.name,
+            user_id=user,
+            team_id=team,
+            file_counts={"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0},
+            status="completed",
+            usage_bytes=0,
+            expires_after=request.expires_after,
+            store_metadata=request.metadata or {}
         )
 
-        print(result)
-
-        if not result:
-            raise HTTPException(status_code=500, detail="Failed to create vector store")
-
-        vector_store = result[0]
+        db.add(store)
+        db.commit()
 
         # Convert to response format
-        created_at = int(vector_store["created_at_timestamp"])
+        created_at = int(store.created_at.timestamp())
         expires_at = (
-            int(vector_store["expires_at"].timestamp())
-            if vector_store.get("expires_at")
+            int(store.expires_at.timestamp())
+            if store.expires_at
             else None
         )
         last_active_at = (
-            int(vector_store["last_active_at"].timestamp())
-            if vector_store.get("last_active_at")
+            int(store.last_active_at.timestamp())
+            if store.last_active_at
             else None
         )
 
         return VectorStoreResponse(
-            id=vector_store["id"],
+            id=store.id.hex,
             created_at=created_at,
-            name=vector_store["name"],
-            usage_bytes=vector_store["usage_bytes"] or 0,
-            file_counts=vector_store["file_counts"]
+            name=store.name,
+            usage_bytes=store.usage_bytes or 0,
+            file_counts=store.file_counts
             or {
                 "in_progress": 0,
                 "completed": 0,
@@ -159,11 +147,11 @@ async def create_vector_store(
                 "cancelled": 0,
                 "total": 0,
             },
-            status=vector_store["status"],
-            expires_after=vector_store["expires_after"],
+            status=store.status,
+            expires_after=store.expires_after,
             expires_at=expires_at,
             last_active_at=last_active_at,
-            metadata=vector_store["metadata"],
+            metadata=store.store_metadata
         )
 
     except Exception as e:
@@ -186,75 +174,45 @@ async def list_vector_stores(
     try:
         limit = min(limit or 20, 100)  # Cap at 100 results
 
-        vector_store_table = settings.table_names["vector_stores"]
         team = litellm_vkey_info['info']['team_id']
         user = None if team else litellm_vkey_info['info']['user_id']
-        # Build base query
-        base_query = f"""
-        SELECT id, name, file_counts, status, usage_bytes, expires_after, expires_at, last_active_at, metadata,
-               EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
-        FROM {vector_store_table}
-        """
 
-        # Add pagination conditions
-        conditions = []
-        params = []
-        param_count = 1
+        statement = select(VectorStore)
 
         if after:
-            conditions.append(f"id > ${param_count}")
-            params.append(after)
-            param_count += 1
+            statement = statement.where(col(VectorStore.id) > uuid.UUID(after))
 
         if before:
-            conditions.append(f"id < ${param_count}")
-            params.append(before)
-            param_count += 1
+            statement = statement.where(col(VectorStore.id) < uuid.UUID(before))
 
         if team:
-            conditions.append(f"team_id = ${param_count}")
-            params.append(team)
-            param_count += 1
+            statement = statement.where(VectorStore.team_id == team)
         elif user:
-            conditions.append(f"user_id = ${param_count}")
-            params.append(user)
-            param_count += 1
+            statement = statement.where(VectorStore.user_id == user)
 
-        if conditions:
-            base_query += " WHERE " + " AND ".join(conditions)
+        statement = statement.order_by(desc(VectorStore.created_at)).limit(limit + 1)
 
-        # Add ordering and limit
-        final_query = base_query + f" ORDER BY created_at DESC LIMIT {limit + 1}"
-
-        print(final_query)
-
-        # Execute query
-        results = await db.query_raw(final_query, *params)
+        res = db.exec(statement)
+        stores = res.all()
 
         # Check if there are more results
-        has_more = len(results) > limit
+        has_more = len(stores) > limit
         if has_more:
-            results = results[:limit]  # Remove extra result
+            stores = stores[:limit]  # Remove extra result
 
         # Convert to response format
         vector_stores = []
-        for row in results:
-            created_at = int(row["created_at_timestamp"])
-            expires_at = (
-                int(row["expires_at"].timestamp()) if row.get("expires_at") else None
-            )
-            last_active_at = (
-                int(row["last_active_at"].timestamp())
-                if row.get("last_active_at")
-                else None
-            )
+        for store in stores:
+            created_at = int(store.created_at.timestamp())
+            expires_at = int(store.expires_at.timestamp()) if store.expires_at else None
+            last_active_at = int(store.last_active_at.timestamp()) if store.last_active_at else None
 
             vector_store = VectorStoreResponse(
-                id=row["id"],
+                id=store.id.hex,
                 created_at=created_at,
-                name=row["name"],
-                usage_bytes=row["usage_bytes"] or 0,
-                file_counts=row["file_counts"]
+                name=store.name,
+                usage_bytes=store.usage_bytes or 0,
+                file_counts=store.file_counts
                 or {
                     "in_progress": 0,
                     "completed": 0,
@@ -262,11 +220,11 @@ async def list_vector_stores(
                     "cancelled": 0,
                     "total": 0,
                 },
-                status=row["status"],
-                expires_after=row["expires_after"],
+                status=store.status,
+                expires_after=store.expires_after,
                 expires_at=expires_at,
                 last_active_at=last_active_at,
-                metadata=row["metadata"],
+                metadata=store.store_metadata,
             )
             vector_stores.append(vector_store)
 
@@ -303,92 +261,65 @@ async def search_vector_store(
     Search a vector store for similar content.
     """
     try:
-        # Check if vector store exists
-        vector_store_table = settings.table_names["vector_stores"]
         team = litellm_vkey_info['info']['team_id']
         user = None if team else litellm_vkey_info['info']['user_id']
-        base_query = f"SELECT id FROM {vector_store_table} WHERE id = $1"
-        search_param = None
+
+        statement = select(VectorStore).where(col(VectorStore.id) == uuid.UUID(vector_store_id))
         if team:
-            base_query += " AND team_id = $2"
-            search_param = team
+            statement = statement.where(VectorStore.team_id == team)
         elif user:
-            base_query += " AND user_id = $2"
-            search_param = user
+            statement = statement.where(VectorStore.user_id == user)
         else:
             raise HTTPException(status_code=401, detail="No valid credentials provided")
 
-        vector_store_result = await db.query_raw(
-            base_query, vector_store_id, search_param
-        )
-        if not vector_store_result:
+        res = db.exec(statement)
+        store = res.first()
+        if not store:
             raise HTTPException(status_code=404, detail="Vector store not found")
 
         # Generate embedding for query
         query_embedding = await generate_query_embedding(request.query, litellm_vkey_info['key'])
-        query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+        query_embedding = query_embedding + [0] * (3072 - len(query_embedding))
 
         # Build the raw SQL query for vector similarity search
         limit = min(request.limit or 20, 100)  # Cap at 100 results
 
-        # Base query with vector similarity using cosine distance
-        # Use configurable field names
-        fields = settings.db_fields
-        table_name = settings.table_names["embeddings"]
-
-        # Build query with proper parameter placeholders for Prisma
-        param_count = 1
-        query_params = [query_vector_str, vector_store_id]
-
-        base_query = f"""
-        SELECT
-            {fields.id_field},
-            {fields.content_field},
-            {fields.metadata_field},
-            ({fields.embedding_field} <=> ${param_count}::vector) as distance
-        FROM {table_name}
-        WHERE {fields.vector_store_id_field} = ${param_count + 1}
-        """
-        param_count += 2
-
-        # Add metadata filters if provided
-        filter_conditions = []
+        embedding_statement = select(
+            Embedding.id, 
+            Embedding.content, 
+            Embedding.embedding_metadata, 
+            Embedding.embedding.l2_distance(query_embedding).label('distance') # pyright: ignore[reportAttributeAccessIssue]
+            ).where(col(VectorStore.id) == uuid.UUID(vector_store_id))
 
         if request.filters:
             for key, value in request.filters.items():
-                filter_conditions.append(
-                    f"{fields.metadata_field}->>${param_count} = ${param_count + 1}"
-                )
-                query_params.extend([key, str(value)])
-                param_count += 2
+                embedding_statement = embedding_statement.where(col(Embedding.embedding_metadata)[key].as_string() == value)
 
-        if filter_conditions:
-            base_query += " AND " + " AND ".join(filter_conditions)
 
-        # Add ordering and limit
-        final_query = base_query + f" ORDER BY distance ASC LIMIT {limit}"
-
-        # Execute the query
-        results = await db.query_raw(final_query, *query_params)
+        embedding_statement = embedding_statement.order_by(label('distance', col(Embedding.embedding)).asc()).limit(limit)
+        embedding_results = db.exec(embedding_statement).all()
 
         # Convert results to SearchResult objects
         search_results = []
-        for row in results:
+        for embedding_result in embedding_results:
             # Convert distance to similarity score (1 - normalized_distance)
             # Cosine distance ranges from 0 (identical) to 2 (opposite)
-            similarity_score = max(0, 1 - (row["distance"] / 2))
+            similarity_score = max(0, 1 - (embedding_result[3] / 2))
 
             # Extract filename from metadata or use a default
-            metadata = row[fields.metadata_field] or {}
-            filename = metadata.get("filename", "document.txt")
+            metadata = embedding_result[2] or {}
+            if not metadata:
+                filename = "document.txt"
+            else:
+                filename = metadata.get("filename", "document.txt") # pyright: ignore[reportAttributeAccessIssue]
 
-            content_chunks = [ContentChunk(type="text", text=row[fields.content_field])]
+            content_chunks = [ContentChunk(type="text", text=embedding_result[1])]
 
             result = SearchResult(
-                file_id=row[fields.id_field],
+                file_id=embedding_result[0].hex,
                 filename=filename,
                 score=similarity_score,
-                attributes=metadata if request.return_metadata else None,
+                attributes=metadata if (request.return_metadata and metadata) else None, # pyright: ignore[reportArgumentType]
                 content=content_chunks,
             )
             search_results.append(result)
@@ -409,105 +340,85 @@ async def search_vector_store(
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
-@app.post(
-    "/v1/vector_stores/{vector_store_id}/embeddings", response_model=EmbeddingResponse
-)
-async def create_embedding(
-    vector_store_id: str,
-    request: EmbeddingCreateRequest,
-    litellm_vkey_info = Depends(get_litellm_vkey_info),
-):
-    """
-    Add a single embedding to a vector store.
-    """
-    try:
-        # Check if vector store exists
-        # TODO deduplicate
-        vector_store_table = settings.table_names["vector_stores"]
-        team = litellm_vkey_info['info']['team_id']
-        user = None if team else litellm_vkey_info['info']['user_id']
-        base_query = f"SELECT id FROM {vector_store_table} WHERE id = $1"
-        search_param = None
-        if team:
-            base_query += " AND team_id = $2"
-            search_param = team
-        elif user:
-            base_query += " AND user_id = $2"
-            search_param = user
-        else:
-            raise HTTPException(status_code=401, detail="No valid credentials provided")
+# @app.post(
+#     "/v1/vector_stores/{vector_store_id}/embeddings", response_model=EmbeddingResponse
+# )
+# async def create_embedding(
+#     vector_store_id: str,
+#     request: EmbeddingCreateRequest,
+#     litellm_vkey_info = Depends(get_litellm_vkey_info),
+# ):
+#     """
+#     Add a single embedding to a vector store.
+#     """
+#     try:
+#         # Check if vector store exists
+#         # TODO deduplicate
+#         team = litellm_vkey_info['info']['team_id']
+#         user = None if team else litellm_vkey_info['info']['user_id']
 
-        vector_store_result = await db.query_raw(
-            base_query, vector_store_id, search_param
-        )
-        if not vector_store_result:
-            raise HTTPException(status_code=404, detail="Vector store not found")
+#         statement = select(VectorStore).where(col(VectorStore.id) == uuid.UUID(vector_store_id))
+#         if team:
+#             statement = statement.where(VectorStore.team_id == team)
+#         elif user:
+#             statement = statement.where(VectorStore.user_id == user)
+#         else:
+#             raise HTTPException(status_code=401, detail="No valid credentials provided")
+        
+#         vector_store = db.exec(statement).first()
+#         if not vector_store:
+#             raise HTTPException(status_code=404, detail="Vector store not found")
 
-        # Convert embedding to vector string format
-        embedding_vector_str = "[" + ",".join(map(str, request.embedding)) + "]"
+#         new_embedding = Embedding(
+#             vector_store_id=uuid.UUID(vector_store_id),
+#             content=request.content,
+#             embedding=request.embedding + [0] * (3072 - len(request.embedding)),
+#             embedding_metadata=request.metadata or {}
+#         )
 
-        # Insert embedding using configurable field names
-        fields = settings.db_fields
-        table_name = settings.table_names["embeddings"]
+#         db.add(new_embedding)
+#         db.commit()
 
-        result = await db.query_raw(
-            f"""
-            INSERT INTO {table_name} ({fields.id_field}, {fields.vector_store_id_field}, {fields.content_field},
-                                     {fields.embedding_field}, {fields.metadata_field}, {fields.created_at_field})
-            VALUES (gen_random_uuid(), $1, $2, $3::vector, $4, NOW())
-            RETURNING {fields.id_field}, {fields.vector_store_id_field}, {fields.content_field},
-                     {fields.metadata_field}, EXTRACT(EPOCH FROM {fields.created_at_field})::bigint as created_at_timestamp
-            """,
-            vector_store_id,
-            request.content,
-            embedding_vector_str,
-            request.metadata or {},
-        )
+#         if not new_embedding.id:
+#             raise HTTPException(status_code=500, detail="Failed to create embedding")
 
-        if not result:
-            raise HTTPException(status_code=500, detail="Failed to create embedding")
+#         # TODO do this through the ORM classes
+#         update_vector_store_table_statement = f"""
+#             UPDATE vectorstore
+#             SET
+#                 file_counts = jsonb_set(
+#                     jsonb_set(
+#                         COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
+#                         '{{completed}}',
+#                         (COALESCE(file_counts->>'completed', '0')::int + 1)::text::jsonb
+#                     ),
+#                     '{{total}}',
+#                     (COALESCE(file_counts->>'total', '0')::int + 1)::text::jsonb
+#                 ),
+#                 usage_bytes = COALESCE(usage_bytes, 0) + LENGTH(:content),
+#                 last_active_at = NOW()
+#             WHERE id = :vector_store_id
+#             """
 
-        embedding = result[0]
+#         res = db.connection().execute(text(update_vector_store_table_statement), {'vector_store_id': vector_store_id, 'content': request.content})
 
-        # Update vector store statistics
-        await db.query_raw(
-            f"""
-            UPDATE {vector_store_table}
-            SET
-                file_counts = jsonb_set(
-                    jsonb_set(
-                        COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
-                        '{{completed}}',
-                        (COALESCE(file_counts->>'completed', '0')::int + 1)::text::jsonb
-                    ),
-                    '{{total}}',
-                    (COALESCE(file_counts->>'total', '0')::int + 1)::text::jsonb
-                ),
-                usage_bytes = COALESCE(usage_bytes, 0) + LENGTH($2),
-                last_active_at = NOW()
-            WHERE id = $1
-            """,
-            vector_store_id,
-            request.content,
-        )
+#         return EmbeddingResponse(
+#             id=new_embedding.id.hex,
+#             vector_store_id=new_embedding.vector_store_id.hex,
+#             content=new_embedding.content,
+#             metadata=new_embedding.embedding_metadata or {},
+#             created_at=int(new_embedding.created_at.timestamp()),
+#         )
 
-        return EmbeddingResponse(
-            id=embedding[fields.id_field],
-            vector_store_id=embedding[fields.vector_store_id_field],
-            content=embedding[fields.content_field],
-            metadata=embedding[fields.metadata_field],
-            created_at=int(embedding["created_at_timestamp"]),
-        )
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         import traceback
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500, detail=f"Failed to create embedding: {str(e)}"
-        )
+#         traceback.print_exc()
+#         raise HTTPException(
+#             status_code=500, detail=f"Failed to create embedding: {str(e)}"
+#         )
 
 
 # TODO check if this API endpoint is valid and needed, I guess it's superseeded by https://developers.openai.com/api/reference/resources/vector_stores/subresources/file_batches/methods/create
@@ -534,24 +445,24 @@ async def _create_embeddings_batch(
     try:
         # TODO deduplicate
         # Check if vector store exists
-        vector_store_table = settings.table_names["vector_stores"]
         team = litellm_vkey_info['info']['team_id']
         user = None if team else litellm_vkey_info['info']['user_id']
-        base_query = f"SELECT id FROM {vector_store_table} WHERE id = $1"
-        search_param = None
+
+        statement = select(VectorStore).where(col(VectorStore.id) == uuid.UUID(vector_store_id))
         if team:
-            base_query += " AND team_id = $2"
-            search_param = team
+            statement = statement.where(VectorStore.team_id == team)
         elif user:
-            base_query += " AND user_id = $2"
-            search_param = user
+            statement = statement.where(VectorStore.user_id == user)
         else:
             raise HTTPException(status_code=401, detail="No valid credentials provided")
 
-        vector_store_result = await db.query_raw(
-            base_query, vector_store_id, search_param
-        )
-        if not vector_store_result:
+        res = db.exec(statement)
+        store = res.first()
+        if not store:
+            raise HTTPException(status_code=404, detail="Vector store not found")
+        
+        vector_store = db.exec(statement).first()
+        if not vector_store:
             raise HTTPException(status_code=404, detail="Vector store not found")
 
         if not embeddings:
@@ -562,81 +473,77 @@ async def _create_embeddings_batch(
         table_name = settings.table_names["embeddings"]
 
         # Build VALUES clause for batch insert
-        values_clauses = []
-        params = []
-        param_count = 1
+        # values_clauses = []
+        # params = []
+        # param_count = 1
 
+        new_embeddings = []
+        total_content_length = 0
         for embedding_req in embeddings:
-            embedding_vector_str = (
-                "[" + ",".join(map(str, embedding_req.embedding)) + "]"
+            # embedding_vector_str = (
+            #     "[" + ",".join(map(str, embedding_req.embedding)) + "]"
+            # )
+            # values_clauses.append(
+            #     f"(gen_random_uuid(), ${param_count}, ${param_count + 1}, ${param_count + 2}, ${param_count + 3}::vector, ${param_count + 4}, NOW())"
+            # )
+            # params.extend(
+            #     [
+            #         vector_store_id,
+            #         vector_store_file_id, 
+            #         embedding_req.content or {},
+            #         embedding_vector_str,
+            #         embedding_req.metadata or {},
+            #     ]
+            # )
+            # param_count += 5
+
+            new_embedding = Embedding(
+                vector_store_id=uuid.UUID(vector_store_id),
+                vector_store_file_id=uuid.UUID(vector_store_file_id),
+                content=embedding_req.content,
+                embedding=embedding_req.embedding + [0] * (3072 - len(embedding_req.embedding)),
+                embedding_metadata=embedding_req.metadata or {}
             )
-            values_clauses.append(
-                f"(gen_random_uuid(), ${param_count}, ${param_count + 1}, ${param_count + 2}, ${param_count + 3}::vector, ${param_count + 4}, NOW())"
-            )
-            params.extend(
-                [
-                    vector_store_id,
-                    vector_store_file_id, 
-                    embedding_req.content or {},
-                    embedding_vector_str,
-                    embedding_req.metadata or {},
-                ]
-            )
-            param_count += 5
 
-        values_clause = ", ".join(values_clauses)
+            new_embeddings.append(new_embedding)
+            total_content_length += len(new_embedding.content)
 
-        # Execute batch insert
-        result = await db.query_raw(
-            f"""
-            INSERT INTO {table_name} ({fields.id_field}, {fields.vector_store_id_field}, {fields.vector_store_file_id_field}, {fields.content_field},
-                                     {fields.embedding_field}, {fields.metadata_field}, {fields.created_at_field})
-            VALUES {values_clause}
-            RETURNING {fields.id_field}, {fields.vector_store_id_field}, {fields.vector_store_file_id_field}, {fields.content_field},
-                     {fields.metadata_field}, EXTRACT(EPOCH FROM {fields.created_at_field})::bigint as created_at_timestamp
-            """,
-            *params,
-        )
 
-        if not result:
-            raise HTTPException(status_code=500, detail="Failed to create embeddings")
-
-        # Calculate total content length for usage bytes update
-        total_content_length = sum(len(emb.content) for emb in embeddings)
+        db.add_all(new_embeddings)
+        db.commit()
 
         # Update vector store statistics
-        await db.query_raw(
-            f"""
-            UPDATE {vector_store_table}
+        # TODO do this through the ORM classes
+        update_statistics_statement = f"""
+            UPDATE vectorstore
             SET
                 file_counts = jsonb_set(
                     jsonb_set(
                         COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
                         '{{completed}}',
-                        (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
+                        (COALESCE(file_counts->>'completed', '0')::int + :length)::text::jsonb
                     ),
                     '{{total}}',
-                    (COALESCE(file_counts->>'total', '0')::int + $2)::text::jsonb
+                    (COALESCE(file_counts->>'total', '0')::int + :length)::text::jsonb
                 ),
-                usage_bytes = COALESCE(usage_bytes, 0) + $3,
+                usage_bytes = COALESCE(usage_bytes, 0) + :total_content_length,
                 last_active_at = NOW()
-            WHERE id = $1
-            """,
-            vector_store_id,
-            len(embeddings),
-            total_content_length,
-        )
+            WHERE id = :vector_store_id
+            """
+        
+        res = db.connection().execute(text(update_statistics_statement), {'vector_store_id': vector_store_id, 'length': len(embeddings), 'total_content_length': total_content_length})
 
         # Convert results to response format
         result_embeddings = []
-        for row in result:
+        new_embedding: Embedding
+        for new_embedding in new_embeddings:
             result_embeddings.append(
                 EmbeddingResponse(
-                    id=row[fields.id_field],
-                    vector_store_id=row[fields.vector_store_id_field],
-                    content=row[fields.content_field],
-                    metadata=row[fields.metadata_field],
-                    created_at=int(row["created_at_timestamp"]),
+                    id=new_embedding.id.hex,
+                    vector_store_id=new_embedding.vector_store_id.hex,
+                    content=new_embedding.content,
+                    metadata=new_embedding.embedding_metadata,
+                    created_at=int(new_embedding.created_at.timestamp()),
                 )
             )
 
@@ -666,96 +573,116 @@ async def create_vector_store_file(
     request: VectorStoreFileRequest,
     litellm_vkey_info = Depends(get_litellm_vkey_info),
 ):
-    """
-    Compute embeddings for prevoiusly uploaded file and insert them into the vector store.
-    """
-    if litellm_vkey_info['info']['team_id']:
-        file_object = await db.file.find_unique(where={"id": request.file_id, "team_id": litellm_vkey_info['info']['team_id']})
-    elif litellm_vkey_info['info']['user_id']:
-        file_object = await db.file.find_unique(where={"id": request.file_id, "user_id": litellm_vkey_info['info']['user_id']})
-        print(request.file_id)
-    else:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    if file_object is None:
-        raise HTTPException(status_code=404, detail="Invalid file id")
+    try:
+        # Check if vector store exists
+        # TODO deduplicate
+        team = litellm_vkey_info['info']['team_id']
+        user = None if team else litellm_vkey_info['info']['user_id']
 
-    litellm_vkey = litellm_vkey_info['key']
+        statement = select(VectorStore).where(col(VectorStore.id) == uuid.UUID(vector_store_id))
+        if team:
+            statement = statement.where(VectorStore.team_id == team)
+        elif user:
+            statement = statement.where(VectorStore.user_id == user)
+        else:
+            raise HTTPException(status_code=401, detail="No valid credentials provided")
 
-    s3_file_handler = S3FileHandler(
-        region=settings.s3_region,
-        access_key=settings.s3_access_key,
-        secret_key=settings.s3_secret_key,
-        bucket=settings.s3_bucket,
-        host=settings.s3_host
-        )
-    
-    filepath = await s3_file_handler.get_file(file_object.filename_on_disk)
-    converter = DocumentConverter()
-    result = converter.convert(filepath)
-    doc = result.document
-    os.remove(filepath)
+        vector_store = db.exec(statement).first()
+        if not vector_store:
+            raise HTTPException(status_code=404, detail="Vector store not found")
 
-    # TODO check if this is a good model for tokenization
-    tokenizer = HuggingFaceTokenizer(
-        tokenizer=AutoTokenizer.from_pretrained(
-            "sentence-transformers/all-MiniLM-L6-v2"
-        ),
-        max_tokens=25,
-    )
+        file_statement = select(File).where(col(File.id) == uuid.UUID(request.file_id))
+        requested_file = db.exec(file_statement).first()
+        if not requested_file:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        litellm_vkey = litellm_vkey_info['key']
 
-    chunker = LineBasedTokenChunker(
-        tokenizer=tokenizer,
-        prefix="",  # No prefix for general documents
-    )
-
-    chunks = list(chunker.chunk(doc))
-    chunk_texts = []
-    for chunk in chunks:
-        chunk_texts.append(chunk.text)
-
-    embedding_vectors = await generate_query_embeddings(chunk_texts, litellm_vkey)
-
-    embedding_create_requests = []
-
-    for index, chunk_text in enumerate(chunk_texts):
-        embedding_create_requests.append(
-            EmbeddingCreateRequest(
-                content=chunk_text,
-                embedding=embedding_vectors[index]["embedding"],
+        s3_file_handler = S3FileHandler(
+            region=settings.s3_region,
+            access_key=settings.s3_access_key,
+            secret_key=settings.s3_secret_key,
+            bucket=settings.s3_bucket,
+            host=settings.s3_host
             )
+    
+        filepath = await s3_file_handler.get_file(requested_file.filename_on_disk)
+        converter = DocumentConverter()
+        result = converter.convert(filepath)
+        doc = result.document
+        os.remove(filepath)
+
+        # TODO check if this is a good model for tokenization
+        tokenizer = HuggingFaceTokenizer(
+            tokenizer=AutoTokenizer.from_pretrained(
+                "sentence-transformers/all-MiniLM-L6-v2"
+            ),
+            max_tokens=25,
         )
 
-    dbobject = await db.vectorstorefile.create(
-        data={
-            "file_id": request.file_id,
-            "user_id": litellm_vkey_info['info']['user_id'] if not litellm_vkey_info['info']['team_id'] else None,
-            "team_id": litellm_vkey_info['info']['team_id'],
-            "vector_store_id": vector_store_id,
-            "attributes": None,
-            "chunking_strategy": None,
-            "created_at": datetime.datetime.now(),
-            "usage_bytes": 0,
-        }
-    )
+        chunker = LineBasedTokenChunker(
+            tokenizer=tokenizer,
+            prefix="",  # No prefix for general documents,
+            omit_prefix_on_overflow=False
+        ) # pyright: ignore[reportCallIssue]
 
-    embedding_result = await _create_embeddings_batch(
-        vector_store_id=vector_store_id, vector_store_file_id=dbobject.id, embeddings=embedding_create_requests, litellm_vkey_info=litellm_vkey_info
-    )
+        chunks = list(chunker.chunk(doc))
+        chunk_texts = []
+        for chunk in chunks:
+            chunk_texts.append(chunk.text)
 
-    await db.vectorstorefile.update(
-        where={'id': dbobject.id},
-        data={'usage_bytes': embedding_result.total_content_length}
-    )
+        embedding_vectors = await generate_query_embeddings(chunk_texts, litellm_vkey)
+        embedding_create_requests = []
 
-    return VectorStoreFileResponse(
-        id=dbobject.id,
-        created_at=dbobject.created_at.strftime("%s"),
-        object="vector_store.file",
-        status="completed",
-        usage_bytes=embedding_result.total_content_length,
-        vector_store_id=vector_store_id,
-    )
+        for index, chunk_text in enumerate(chunk_texts):
+            embedding_create_requests.append(
+                EmbeddingCreateRequest(
+                    content=chunk_text,
+                    embedding=embedding_vectors[index],
+                )
+            )
+
+        new_vector_store_file = VectorStoreFile(
+            file_id=uuid.UUID(request.file_id),
+            user_id=user,
+            team_id=team,
+            vector_store_id=uuid.UUID(vector_store_id),
+            attributes=None,
+            chunking_strategy="static",
+            created_at=datetime.datetime.now(),
+            usage_bytes=0,
+        )
+
+        db.add(new_vector_store_file)
+        db.commit()
+        db.refresh(new_vector_store_file)
+
+        embedding_result = await _create_embeddings_batch(
+            vector_store_id=vector_store_id, vector_store_file_id=new_vector_store_file.id.hex, embeddings=embedding_create_requests, litellm_vkey_info=litellm_vkey_info
+        )
+
+        new_vector_store_file.usage_bytes = embedding_result.total_content_length
+        db.add(new_vector_store_file)
+        db.commit()
+
+        return VectorStoreFileResponse(
+            id=new_vector_store_file.id.hex,
+            created_at=int(new_vector_store_file.created_at.timestamp()),
+            object="vector_store.file",
+            status="completed",
+            usage_bytes=embedding_result.total_content_length,
+            vector_store_id=vector_store_id,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create embedding: {str(e)}"
+        )
 
 
 @app.get("/health")

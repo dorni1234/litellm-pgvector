@@ -1,7 +1,17 @@
 from typing import Dict, Optional
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
+from urllib.parse import urlparse, parse_qs
 
+def get_db_schema_name(uri) -> str:
+    parsed_uri = urlparse(uri)
+    if not parsed_uri.query:
+        raise Exception('No schema provided in the DATABASE_URL uri')
+    parsed_query_string = parse_qs(parsed_uri.query)
+    if not 'schema' in parsed_query_string:
+        raise Exception('No schema provided in the DATABASE_URL uri')
+
+    return str(parsed_query_string['schema'].pop())
 
 class DatabaseFieldConfig(BaseModel):
     """Configuration for database field mappings"""
@@ -25,7 +35,8 @@ class EmbeddingConfig(BaseModel):
 class Settings(BaseSettings):
     """Application settings"""
     # Database configuration
-    database_url: str = "postgresql://username:password@localhost:5432/vectordb?schema=public"
+    database_url: str = ""
+    database_url_2: str = ""
 
     # API configuration
     server_api_key: str = "your-api-key-here"
@@ -68,6 +79,9 @@ class Settings(BaseSettings):
             "files": "File"
         }
 
+    @property
+    def database_schema(self) -> str:
+        return get_db_schema_name(self.database_url_2)
 
 # Global settings instance
 settings = Settings()

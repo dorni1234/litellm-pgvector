@@ -69,7 +69,7 @@ class Database:
     def __init__(self):
         # self._engine = create_engine(settings.database_url_2)
         # psycopg2 tends to choke on = signs in the database uri, so we replace it
-        self._engine = create_engine(quote_plus(settings.database_url_2, safe=":/?_@"))
+        self._engine = create_engine(quote_plus(settings.database_url, safe=":/?_@"))
         with self._engine.connect() as conn:
             if not conn.dialect.has_schema(conn, settings.database_schema):
                 conn.execute(CreateSchema(settings.database_schema))

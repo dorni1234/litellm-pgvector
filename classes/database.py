@@ -60,7 +60,7 @@ class File(SQLModel, table=True):
     created_at: datetime = Field(sa_column=Column(TIMESTAMP), default_factory=lambda: datetime.now())
     expires_at: datetime | None = Field(sa_column=Column(TIMESTAMP, nullable=True), default=None)
     filename_on_disk: str
-    vector_store_file: VectorStoreFile = Relationship(cascade_delete=True)
+    vector_store_files: list[VectorStoreFile] = Relationship(cascade_delete=True)
 
 
 class Database:

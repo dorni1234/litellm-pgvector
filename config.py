@@ -9,7 +9,7 @@ def get_db_schema_name(uri) -> str:
         raise Exception('No schema provided in the DATABASE_URL uri')
     parsed_query_string = parse_qs(parsed_uri.query)
     if not 'schema' in parsed_query_string:
-        raise Exception('No schema provided in the DATABASE_URL uri')
+        return "public"
 
     return str(parsed_query_string['schema'].pop())
 
@@ -26,10 +26,9 @@ class DatabaseFieldConfig(BaseModel):
 
 class EmbeddingConfig(BaseModel):
     """Configuration for embedding generation via LiteLLM proxy"""
-    model: str = "text-embedding-ada-002"
+    model: str = "litellm_proxy/qwen3-embedding:8b"
     base_url: str = "http://localhost:4000"  # LiteLLM proxy URL
-    api_key: str = "sk-1234"  # LiteLLM proxy API key
-    dimensions: int = 1536
+    dimensions: int = 3072
 
 
 class Settings(BaseSettings):
@@ -38,7 +37,6 @@ class Settings(BaseSettings):
     database_url: str = ""
 
     # API configuration
-    server_api_key: str = "your-api-key-here"
     port: int = 8000
     host: str = "0.0.0.0"
 

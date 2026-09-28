@@ -12,7 +12,7 @@ from classes.s3_file_handler import S3FileHandler
 from util import get_litellm_vkey_info
 from config import settings
 from classes.database import database_instance, File
-from sqlmodel import select, col
+from sqlmodel import select, col, text
 from uuid import UUID
 
 router = APIRouter()
@@ -116,12 +116,39 @@ async def delete_file(
 
         await s3_file_handler.delete_file(file.filename_on_disk)
 
+        for vector_store_file in file.vector_store_files:
+            # Update vector store statistics
+            # TODO do this through the ORM classes
+            # TODO add counter to in_progress when adding the job to the job queue
+            update_statistics_statement = f"""
+                UPDATE {settings.database_schema}.vectorstore
+                SET
+                    file_counts = jsonb_set(
+                        jsonb_set(
+                            COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
+                            '{{completed}}',
+                            (COALESCE(file_counts->>'completed', '0')::int - 1)::text::jsonb
+                        ),
+                        '{{total}}',
+                        (COALESCE(file_counts->>'total', '0')::int - 1)::text::jsonb
+                    ),
+                    usage_bytes = COALESCE(usage_bytes, 0) - :usage_bytes,
+                    last_active_at = NOW()
+                WHERE id = :vector_store_id
+                """
+            
+            res = session.connection().execute(
+                text(update_statistics_statement),
+                {
+                    'vector_store_id': vector_store_file.vector_store_id,
+                    'usage_bytes': vector_store_file.usage_bytes
+                }
+            )
+
         session.delete(file)
         session.commit()
+
         session.close()
-
-        # TODO update vector store statistics
-
         return DeleteFileResponse(id=file_id)
 
     except HTTPException:

@@ -1,3 +1,22 @@
+# TODO (28.09.2026)
+- [ ] Prevent a file that has already been inserted into a vector store from being inserted a second time
+- [ ] Allow deletion of files just from the vector store without also deleting it from the S3 storage. At the moment, the /delete route also deletes the S3 file
+- [ ] Add async job queue for embeddings. At the moment, everything is done synchronously within the request thread
+- [ ] Optimize tokenization, pre-install required dockling packages during container image creation. At the moment, dockling downloads required dependencies on the fly depending on the uploaded file format
+- [ ] Add format filter for uploaded files
+- [ ] Optimize document chunking, tokenization. At the moment, dockling tokenizes documents on the CPU in the request thread with a small model downloaded from huggingface
+- [ ] Implement quota system for S3 storage, vector DB storage, amount of created vector stores
+- [ ] Split project into more files to increase readability
+
+# SETUP
+- Copy `env.example` to `.env`, enter values
+- Create a docker contianer from the Dockerifle or run the Devcontainer in `.devcontainer/devcontainer.json`. 
+  - When running the Devcontainer: You will need to adjust the `runArgs` parameter, depending on your setup. Currently, it is used to connect the created container to a docker network that contains the litellm service.
+  - When running the Devcontainer: Run `python main.py` within the devcontainer to start the application. 
+- On startup, the Vector extension in Postgres will be enabled and the database tables will be created.
+- Look at the API routes at http://localhost:8000/docs when the container is running. Every route requires a HTTP Bearer token that is a valid LiteLLM virtual key
+-----
+
 # OpenAI Vector Stores API with PGVector
 
 A FastAPI application that provides OpenAI-compatible vector store endpoints using PGVector and LiteLLM proxy for embeddings.

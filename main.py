@@ -1,12 +1,10 @@
 import os
-import asyncio
 import time
-import shutil
 import uuid
 import datetime
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from typing import Annotated
@@ -23,15 +21,13 @@ from models import (
     SearchResult,
     EmbeddingCreateRequest,
     EmbeddingResponse,
-    EmbeddingBatchCreateRequest,
     EmbeddingBatchCreateResponse,
     VectorStoreListResponse,
     ContentChunk,
     VectorStoreFileResponse,
     VectorStoreFileRequest,
-    UploadFileRequest,
-    UploadFileResponse,
 )
+
 from config import settings
 from embedding_service import embedding_service
 from classes.s3_file_handler import S3FileHandler
@@ -64,12 +60,12 @@ security = HTTPBearer()
 
 db = database_instance.session()
 
-async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Validate API key from Authorization header"""
-    expected_key = settings.server_api_key
-    if credentials.credentials != expected_key:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return credentials.credentials
+# async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+#     """Validate API key from Authorization header"""
+#     expected_key = settings.server_api_key
+#     if credentials.credentials != expected_key:
+#         raise HTTPException(status_code=401, detail="Invalid API key")
+#     return credentials.credentials
 
 
 # @app.on_event("startup")
@@ -468,35 +464,9 @@ async def _create_embeddings_batch(
         if not embeddings:
             raise HTTPException(status_code=400, detail="No embeddings provided")
 
-        # Prepare batch insert
-        fields = settings.db_fields
-        table_name = settings.table_names["embeddings"]
-
-        # Build VALUES clause for batch insert
-        # values_clauses = []
-        # params = []
-        # param_count = 1
-
         new_embeddings = []
         total_content_length = 0
         for embedding_req in embeddings:
-            # embedding_vector_str = (
-            #     "[" + ",".join(map(str, embedding_req.embedding)) + "]"
-            # )
-            # values_clauses.append(
-            #     f"(gen_random_uuid(), ${param_count}, ${param_count + 1}, ${param_count + 2}, ${param_count + 3}::vector, ${param_count + 4}, NOW())"
-            # )
-            # params.extend(
-            #     [
-            #         vector_store_id,
-            #         vector_store_file_id, 
-            #         embedding_req.content or {},
-            #         embedding_vector_str,
-            #         embedding_req.metadata or {},
-            #     ]
-            # )
-            # param_count += 5
-
             new_embedding = Embedding(
                 vector_store_id=uuid.UUID(vector_store_id),
                 vector_store_file_id=uuid.UUID(vector_store_file_id),
@@ -504,16 +474,15 @@ async def _create_embeddings_batch(
                 embedding=embedding_req.embedding + [0] * (3072 - len(embedding_req.embedding)),
                 embedding_metadata=embedding_req.metadata or {}
             )
-
             new_embeddings.append(new_embedding)
             total_content_length += len(new_embedding.content)
-
 
         db.add_all(new_embeddings)
         db.commit()
 
         # Update vector store statistics
         # TODO do this through the ORM classes
+        # TODO add counter to in_progress when adding the job to the job queue
         update_statistics_statement = f"""
             UPDATE {settings.database_schema}.vectorstore
             SET
@@ -521,17 +490,23 @@ async def _create_embeddings_batch(
                     jsonb_set(
                         COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
                         '{{completed}}',
-                        (COALESCE(file_counts->>'completed', '0')::int + :length)::text::jsonb
+                        (COALESCE(file_counts->>'completed', '0')::int + 1)::text::jsonb
                     ),
                     '{{total}}',
-                    (COALESCE(file_counts->>'total', '0')::int + :length)::text::jsonb
+                    (COALESCE(file_counts->>'total', '0')::int + 1)::text::jsonb
                 ),
                 usage_bytes = COALESCE(usage_bytes, 0) + :total_content_length,
                 last_active_at = NOW()
             WHERE id = :vector_store_id
             """
         
-        res = db.connection().execute(text(update_statistics_statement), {'vector_store_id': vector_store_id, 'length': len(embeddings), 'total_content_length': total_content_length})
+        res = db.connection().execute(
+            text(update_statistics_statement),
+            {
+                'vector_store_id': vector_store_id,
+                'total_content_length': total_content_length
+            }
+        )
 
         # Convert results to response format
         result_embeddings = []
@@ -658,7 +633,10 @@ async def create_vector_store_file(
         db.refresh(new_vector_store_file)
 
         embedding_result = await _create_embeddings_batch(
-            vector_store_id=vector_store_id, vector_store_file_id=new_vector_store_file.id.hex, embeddings=embedding_create_requests, litellm_vkey_info=litellm_vkey_info
+            vector_store_id=vector_store_id, 
+            vector_store_file_id=new_vector_store_file.id.hex, 
+            embeddings=embedding_create_requests, 
+            litellm_vkey_info=litellm_vkey_info
         )
 
         new_vector_store_file.usage_bytes = embedding_result.total_content_length

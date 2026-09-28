@@ -28,9 +28,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project
 COPY . .
 
-# Generate Prisma client
-# RUN prisma generate
-
 # Expose port
 EXPOSE 8000
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from hashlib import sha256
 from light_s3_client import Client
 from typing import Optional
+from io import BytesIO
 
 class S3FileHandler(AbstractFileHandler):
     _s3_client: Client
@@ -28,11 +29,13 @@ class S3FileHandler(AbstractFileHandler):
         key = f"{uuid.uuid4().hex}_{file.filename}"
         key_with_subdir = os.path.join(subdirectory, key)
 
+
+
         try:
             file.file.seek(0)
             contents = await file.read()
             res = self._s3_client.upload_fileobj(
-                Fileobj=contents,
+                Fileobj=BytesIO(contents),
                 Bucket="vectorstore",
                 Key=key_with_subdir
                 )

@@ -1,5 +1,5 @@
 # TODO (28.09.2026)
-- [ ] Prevent a file that has already been inserted into a vector store from being inserted a second time
+- [X] Prevent a file that has already been inserted into a vector store from being inserted a second time
 - [ ] Allow deletion of files just from the vector store without also deleting it from the S3 storage. At the moment, the /delete route also deletes the S3 file
 - [ ] Add async job queue for embeddings. At the moment, everything is done synchronously within the request thread
 - [ ] Optimize tokenization, pre-install required dockling packages during container image creation. At the moment, dockling downloads required dependencies on the fly depending on the uploaded file format

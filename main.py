@@ -8,10 +8,7 @@ from fastapi.security import HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from typing import Annotated
-from docling.document_converter import DocumentConverter
-from docling_core.transforms.chunker.line_chunker import LineBasedTokenChunker
-from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
-from transformers import AutoTokenizer
+
 
 from models import (
     VectorStoreCreateRequest,
@@ -19,21 +16,15 @@ from models import (
     VectorStoreSearchRequest,
     VectorStoreSearchResponse,
     SearchResult,
-    EmbeddingCreateRequest,
-    EmbeddingResponse,
-    EmbeddingBatchCreateResponse,
     VectorStoreListResponse,
     ContentChunk,
-    VectorStoreFileResponse,
-    VectorStoreFileRequest,
 )
 
 from config import settings
 from embedding_service import embedding_service
-from classes.s3_file_handler import S3FileHandler
 from util import get_litellm_vkey_info
 from routers import files
-from classes.database import database_instance, VectorStore, Embedding, File, VectorStoreFile
+from classes.database import database_instance, VectorStore, Embedding
 from sqlmodel import select, col, text, desc
 from sqlalchemy import label
 
@@ -430,238 +421,6 @@ async def search_vector_store(
 #     return await _create_embeddings_batch(
 #         vector_store_id=vector_store_id, embeddings=request, litellm_vkey_info=litellm_vkey_info
 #     )
-
-
-async def _create_embeddings_batch(
-    vector_store_id: str, vector_store_file_id: str, embeddings: List[EmbeddingCreateRequest], litellm_vkey_info
-):
-    """
-    Add multiple embeddings to a vector store in batch.
-    """
-    try:
-        # TODO deduplicate
-        # Check if vector store exists
-        team = litellm_vkey_info['info']['team_id']
-        user = None if team else litellm_vkey_info['info']['user_id']
-
-        statement = select(VectorStore).where(col(VectorStore.id) == uuid.UUID(vector_store_id))
-        if team:
-            statement = statement.where(VectorStore.team_id == team)
-        elif user:
-            statement = statement.where(VectorStore.user_id == user)
-        else:
-            raise HTTPException(status_code=401, detail="No valid credentials provided")
-
-        res = db.exec(statement)
-        store = res.first()
-        if not store:
-            raise HTTPException(status_code=404, detail="Vector store not found")
-        
-        vector_store = db.exec(statement).first()
-        if not vector_store:
-            raise HTTPException(status_code=404, detail="Vector store not found")
-
-        if not embeddings:
-            raise HTTPException(status_code=400, detail="No embeddings provided")
-
-        new_embeddings = []
-        total_content_length = 0
-        for embedding_req in embeddings:
-            new_embedding = Embedding(
-                vector_store_id=uuid.UUID(vector_store_id),
-                vector_store_file_id=uuid.UUID(vector_store_file_id),
-                content=embedding_req.content,
-                embedding=embedding_req.embedding + [0] * (3072 - len(embedding_req.embedding)),
-                embedding_metadata=embedding_req.metadata or {}
-            )
-            new_embeddings.append(new_embedding)
-            total_content_length += len(new_embedding.content)
-
-        db.add_all(new_embeddings)
-        db.commit()
-
-        # Update vector store statistics
-        # TODO do this through the ORM classes
-        # TODO add counter to in_progress when adding the job to the job queue
-        update_statistics_statement = f"""
-            UPDATE {settings.database_schema}.vectorstore
-            SET
-                file_counts = jsonb_set(
-                    jsonb_set(
-                        COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
-                        '{{completed}}',
-                        (COALESCE(file_counts->>'completed', '0')::int + 1)::text::jsonb
-                    ),
-                    '{{total}}',
-                    (COALESCE(file_counts->>'total', '0')::int + 1)::text::jsonb
-                ),
-                usage_bytes = COALESCE(usage_bytes, 0) + :total_content_length,
-                last_active_at = NOW()
-            WHERE id = :vector_store_id
-            """
-        
-        res = db.connection().execute(
-            text(update_statistics_statement),
-            {
-                'vector_store_id': vector_store_id,
-                'total_content_length': total_content_length
-            }
-        )
-
-        # Convert results to response format
-        result_embeddings = []
-        new_embedding: Embedding
-        for new_embedding in new_embeddings:
-            result_embeddings.append(
-                EmbeddingResponse(
-                    id=new_embedding.id.hex,
-                    vector_store_id=new_embedding.vector_store_id.hex,
-                    content=new_embedding.content,
-                    metadata=new_embedding.embedding_metadata,
-                    created_at=int(new_embedding.created_at.timestamp()),
-                )
-            )
-
-        return EmbeddingBatchCreateResponse(
-            data=result_embeddings,
-            created=int(time.time()),
-            total_content_length=total_content_length,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500, detail=f"Failed to create embeddings batch: {str(e)}"
-        )
-
-
-@app.post(
-    "/v1/vector_stores/{vector_store_id}/files",
-    response_model=VectorStoreFileResponse,
-)
-async def create_vector_store_file(
-    vector_store_id: str,
-    request: VectorStoreFileRequest,
-    litellm_vkey_info = Depends(get_litellm_vkey_info),
-):
-    try:
-        # Check if vector store exists
-        # TODO deduplicate
-        team = litellm_vkey_info['info']['team_id']
-        user = None if team else litellm_vkey_info['info']['user_id']
-
-        statement = select(VectorStore).where(col(VectorStore.id) == uuid.UUID(vector_store_id))
-        if team:
-            statement = statement.where(VectorStore.team_id == team)
-        elif user:
-            statement = statement.where(VectorStore.user_id == user)
-        else:
-            raise HTTPException(status_code=401, detail="No valid credentials provided")
-
-        vector_store = db.exec(statement).first()
-        if not vector_store:
-            raise HTTPException(status_code=404, detail="Vector store not found")
-
-        file_statement = select(File).where(col(File.id) == uuid.UUID(request.file_id))
-        requested_file = db.exec(file_statement).first()
-        if not requested_file:
-            raise HTTPException(status_code=404, detail="File not found")
-        
-        litellm_vkey = litellm_vkey_info['key']
-
-        s3_file_handler = S3FileHandler(
-            region=settings.s3_region,
-            access_key=settings.s3_access_key,
-            secret_key=settings.s3_secret_key,
-            bucket=settings.s3_bucket,
-            host=settings.s3_host
-            )
-    
-        filepath = await s3_file_handler.get_file(requested_file.filename_on_disk)
-        converter = DocumentConverter()
-        result = converter.convert(filepath)
-        doc = result.document
-        os.remove(filepath)
-
-        # TODO check if this is a good model for tokenization
-        tokenizer = HuggingFaceTokenizer(
-            tokenizer=AutoTokenizer.from_pretrained(
-                "sentence-transformers/all-MiniLM-L6-v2"
-            ),
-            max_tokens=25,
-        )
-
-        chunker = LineBasedTokenChunker(
-            tokenizer=tokenizer,
-            prefix="",  # No prefix for general documents,
-            omit_prefix_on_overflow=False
-        ) # pyright: ignore[reportCallIssue]
-
-        chunks = list(chunker.chunk(doc))
-        chunk_texts = []
-        for chunk in chunks:
-            chunk_texts.append(chunk.text)
-
-        embedding_vectors = await generate_query_embeddings(chunk_texts, litellm_vkey)
-        embedding_create_requests = []
-
-        for index, chunk_text in enumerate(chunk_texts):
-            embedding_create_requests.append(
-                EmbeddingCreateRequest(
-                    content=chunk_text,
-                    embedding=embedding_vectors[index],
-                )
-            )
-
-        new_vector_store_file = VectorStoreFile(
-            file_id=uuid.UUID(request.file_id),
-            user_id=user,
-            team_id=team,
-            vector_store_id=uuid.UUID(vector_store_id),
-            attributes=None,
-            chunking_strategy="static",
-            created_at=datetime.datetime.now(),
-            usage_bytes=0,
-        )
-
-        db.add(new_vector_store_file)
-        db.commit()
-        db.refresh(new_vector_store_file)
-
-        embedding_result = await _create_embeddings_batch(
-            vector_store_id=vector_store_id, 
-            vector_store_file_id=new_vector_store_file.id.hex, 
-            embeddings=embedding_create_requests, 
-            litellm_vkey_info=litellm_vkey_info
-        )
-
-        new_vector_store_file.usage_bytes = embedding_result.total_content_length
-        db.add(new_vector_store_file)
-        db.commit()
-
-        return VectorStoreFileResponse(
-            id=new_vector_store_file.id.hex,
-            created_at=int(new_vector_store_file.created_at.timestamp()),
-            object="vector_store.file",
-            status="completed",
-            usage_bytes=embedding_result.total_content_length,
-            vector_store_id=vector_store_id,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500, detail=f"Failed to create embedding: {str(e)}"
-        )
-
 
 @app.get("/health")
 async def health_check():

@@ -7,11 +7,11 @@ security = HTTPBearer()
 
 async def get_litellm_vkey_info(credentials: HTTPAuthorizationCredentials = Depends(security)):
     litellm_api_key = settings.litellm_api_key
+    litellm_host = settings.embedding.base_url
     provided_litellm_vkey = credentials.credentials
     async with AsyncClient() as client:
-        # TODO replace with env var
         response = await client.get(
-            f"http://litellm:4000/key/info?key={provided_litellm_vkey}",
+            f"{litellm_host}/key/info?key={provided_litellm_vkey}",
             headers={"Authorization": f"Bearer {litellm_api_key}"}
             )
         if response.status_code != 200:

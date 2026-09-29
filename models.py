@@ -8,7 +8,7 @@ from fastapi import UploadFile, Form
 class VectorStoreCreateRequest(BaseModel):
     name: str
     file_ids: Optional[List[str]] = None
-    expires_after: Optional[Dict[str, Any]] = None
+    expires_after: Optional["VectorStoreExpiresAfterObject"] = None
     chunking_strategy: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -21,7 +21,7 @@ class VectorStoreResponse(BaseModel):
     usage_bytes: int
     file_counts: Dict[str, int]
     status: str
-    expires_after: Optional[Dict[str, Any]] = None
+    expires_after: Optional["VectorStoreExpiresAfterObject"] = None
     expires_at: Optional[int] = None
     last_active_at: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -150,3 +150,39 @@ class DeleteFileResponse(BaseModel):
     id: str
     object: str = "file"
     deleted: bool = True
+
+class VectorStoreRetrieveResponse(BaseModel):
+    id: str
+    object: str = "vector_store"
+    created_at: int
+    name: str
+    file_counts: Optional[Dict[str, int]] = None
+    usage_bytes: int
+    last_active_at: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class VectorStoreDeleteResponse(BaseModel):
+    id: str
+    object: str = "vector_store.deleted"
+    deleted: bool = True
+
+class VectorStoreExpiresAfterObject(BaseModel):
+    anchor: Literal["last_active_at"]
+    days: int
+
+VectorStoreExpiresAfterObject.model_rebuild()
+
+class VectorStoreUpdateRequest(BaseModel):
+    expires_after: Optional[VectorStoreExpiresAfterObject] = None
+    metadata: Optional[Dict[str, Any]] = None
+    name: Optional[str] = None
+
+class VectorStoreUpdateResponse(BaseModel):
+    id: str
+    object: str = "vector_store"
+    created_at: int
+    name: str
+    file_counts: Optional[Dict[str, int]] = None
+    usage_bytes: int
+    last_active_at: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None

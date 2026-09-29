@@ -6,7 +6,8 @@ from sqlalchemy.schema import CreateSchema
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from pgvector.sqlalchemy import Vector
 from datetime import datetime
-from pydantic import ConfigDict
+
+from models import VectorStoreExpiresAfterObject
 
 from urllib.parse import quote_plus
 
@@ -23,10 +24,11 @@ class VectorStore(SQLModel, table=True):
     status: str = Field(default="completed")
     usage_bytes: int | None = Field(default=0)
     created_at: datetime = Field(sa_column=Column(TIMESTAMP), default_factory=lambda: datetime.now())
-    expires_after: dict | None = Field(sa_column=Column(JSONB, nullable=True), default=None)
+    expires_after: VectorStoreExpiresAfterObject | None = Field(sa_column=Column(JSONB, nullable=True), default=None)
     expires_at: datetime | None = Field(sa_column=Column(TIMESTAMP, nullable=True), default=None)
     last_active_at: datetime | None = Field(sa_column=Column(TIMESTAMP, nullable=True), default=None)
     store_metadata: dict | None = Field(sa_column=Column(JSONB, nullable=True), default=None)     # orig name was metadata, changed as metadata is reserved in SQLAlchemy
+    vector_store_files: list["VectorStoreFile"] = Relationship(cascade_delete=True)
 
 class Embedding(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -49,6 +51,8 @@ class VectorStoreFile(SQLModel, table=True):
     usage_bytes: int
     created_at: datetime = Field(sa_column=Column(TIMESTAMP), default_factory=lambda: datetime.now())
     embeddings: list[Embedding] = Relationship(cascade_delete=True)
+
+VectorStoreFile.model_rebuild()
 
 class File(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -79,6 +83,6 @@ class Database:
         SQLModel.metadata.create_all(self._engine)
 
     def session(self):
-        return Session(self._engine)
+        return Session(self._engine, expire_on_commit=False)
 
 database_instance = Database()
